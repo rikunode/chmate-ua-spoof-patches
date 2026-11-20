@@ -1,6 +1,9 @@
 package app.chmateuaspoof.patches
 
 import app.morphe.patcher.extensions.InstructionExtensions.addInstruction
+import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
+import app.morphe.patcher.extensions.InstructionExtensions.addInstructionsWithLabels
+import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
 import app.morphe.patcher.extensions.InstructionExtensions.replaceInstruction
 import app.morphe.patcher.patch.ApkFileType
 import app.morphe.patcher.patch.AppTarget
@@ -11,6 +14,7 @@ import app.morphe.patcher.patch.bytecodePatch
 import app.morphe.patcher.patch.resourcePatch
 import app.morphe.patcher.util.proxy.mutableTypes.MutableClass
 import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod
+import app.morphe.patcher.util.smali.ExternalLabel
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.iface.ClassDef
 import com.android.tools.smali.dexlib2.iface.Method
@@ -25,6 +29,7 @@ private const val TARGET_VERSION = "0.8.10.226 dev"
 private const val EXT = "Lapp/morphe/extension/chmateuaspoof"
 private const val UA = "$EXT/UaSpoof;"
 private const val SETTINGS = "$EXT/UaSpoofSettings;"
+private const val ENTRY = "$EXT/UaSpoofHaiagaruEntry;"
 private const val ACTIVITY = "app.morphe.extension.chmateuaspoof.UaSpoofActivity"
 private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
@@ -33,6 +38,10 @@ private const val APPLICATION = "Ljp/syoboi/a2chMate/RoidonApp;"
 private const val REQUEST = "Lo/zzdA;" // okhttp3.Request: url h, method c, headers a
 private const val CHALLENGE_DIALOG = "Lo/isOpenJSSEPreferred;" // native Cloudflare challenge WebView
 private const val IN_APP_BROWSER = "Lo/TTLandingPageActivity7;" // native in-app browser WebView
+// Haiagaru 1.46.0 settings screen (extension classes; inspected in the official 1.46.0 bundle).
+private const val HAIAGARU_GROUPS_CLASS = "Lapp/morphe/extension/chmate/HaiagaruSettingsActivityKt;"
+private const val HAIAGARU_CATEGORY_CLASS = "Lapp/morphe/extension/chmate/Haiagaru;"
+private const val HAIAGARU_GROUP = "Lapp/morphe/extension/chmate/SettingsGroup;"
 private const val SET_UA = "Landroid/webkit/WebSettings;->setUserAgentString(Ljava/lang/String;)V"
 private val CONNECTION_TYPES = setOf(
     "Ljava/net/URLConnection;", "Ljava/net/HttpURLConnection;", "Ljavax/net/ssl/HttpsURLConnection;",
@@ -101,8 +110,9 @@ val chMateUaSpoofPatch = bytecodePatch(
         val constructors = hookRequestConstructors()
         val webViews = hookWebViews()
         val connections = hookConnections()
+        val entry = hookHaiagaruSettings()
         println("ChMate UA Spoof: $constructors request constructors, $webViews WebView UA calls, " +
-            "$connections java.net boundaries")
+            "$connections java.net boundaries, Haiagaru settings entry: $entry")
     }
 }
 
@@ -116,6 +126,45 @@ private fun BytecodePatchContext.hookStartup() {
         it.name == "attachBaseContext" && it.parameterTypes.map(CharSequence::toString) == listOf("Landroid/content/Context;")
     } ?: throw PatchException("UA Spoof: Application.attachBaseContext missing")
     attach.addInstruction(0, "invoke-static/range {p1 .. p1}, $SETTINGS->init(Landroid/content/Context;)V")
+}
+
+/** Appends one group to Haiagaru's settings top list and supplies its controls. Only the two
+ *  return/entry points are touched; existing groups and categories are passed through unchanged.
+ *  Skipped (launcher screen only) when Haiagaru's settings classes do not match 1.46.0. */
+private fun BytecodePatchContext.hookHaiagaruSettings(): String {
+    val groupsClass = classDefByOrNull(HAIAGARU_GROUPS_CLASS)
+    val categoryClass = classDefByOrNull(HAIAGARU_CATEGORY_CLASS)
+    if (groupsClass == null || categoryClass == null || classDefByOrNull(HAIAGARU_GROUP) == null) return "skipped (Haiagaru not found)"
+    val groups = groupsClass.methods.singleOrNull {
+        it.name == "settingsGroups" && it.parameterTypes.isEmpty() && it.returnType == "Ljava/util/List;" && it.implementation != null
+    }
+    val category = categoryClass.methods.singleOrNull {
+        it.name == "settingsCategory" && it.returnType == "Landroid/widget/LinearLayout;" && it.implementation != null &&
+            it.parameterTypes.map(CharSequence::toString) == listOf("Landroid/app/Activity;", "Ljava/lang/String;")
+    }
+    if (groups == null || category == null) return "skipped (Haiagaru settings signatures differ)"
+    if ((category.implementation!!.registerCount) < 3) return "skipped (no local register)"
+
+    val groupsMethod = mutableClassDefBy(HAIAGARU_GROUPS_CLASS).mutable(groups)
+    val code = groupsMethod.implementation!!.instructions.toList()
+    val returns = code.indices.filter { code[it].opcode == Opcode.RETURN_OBJECT }
+    if (returns.isEmpty()) throw PatchException("UA Spoof: Haiagaru settingsGroups has no return")
+    returns.asReversed().forEach { index ->
+        val register = (code[index] as OneRegisterInstruction).registerA
+        // Replacing the return keeps any branch label on our call, so every path passes through it.
+        groupsMethod.replaceInstruction(index, "invoke-static/range {v$register .. v$register}, " +
+            "$ENTRY->groups(Ljava/util/List;)Ljava/util/List;")
+        groupsMethod.addInstructions(index + 1, "move-result-object v$register\nreturn-object v$register")
+    }
+
+    val categoryMethod = mutableClassDefBy(HAIAGARU_CATEGORY_CLASS).mutable(category)
+    categoryMethod.addInstructionsWithLabels(0, """
+        invoke-static/range {p0 .. p1}, $ENTRY->category(Landroid/app/Activity;Ljava/lang/String;)Landroid/widget/LinearLayout;
+        move-result-object v0
+        if-eqz v0, :haiagaru
+        return-object v0
+    """, ExternalLabel("haiagaru", categoryMethod.getInstruction(0)))
+    return "added"
 }
 
 private fun BytecodePatchContext.hookRequestConstructors(): Int {

@@ -47,6 +47,22 @@ public class VerifyPatchedApk {
         return r instanceof MethodReference ? r.toString() : null;
     }
 
+    /** Opcode (+ method reference) sequence of a method, independent of offsets. Branch widths
+     *  (goto/goto16/goto32) and alignment NOPs are normalized, as inserting code may change them. */
+    static List<String> code(Map<String, ClassDef> classes, String type, String name) {
+        List<String> out = new ArrayList<>();
+        ClassDef c = classes.get(type);
+        if (c == null) return out;
+        for (Method m : c.getMethods())
+            if (m.getName().equals(name) && m.getImplementation() != null)
+                for (Instruction i : m.getImplementation().getInstructions()) {
+                    if (i.getOpcode() == Opcode.NOP) continue;
+                    String ref = call(i), op = i.getOpcode().name().startsWith("GOTO") ? "GOTO" : i.getOpcode().name();
+                    out.add(op + (ref == null ? "" : " " + ref));
+                }
+        return out;
+    }
+
     static void check(boolean ok, String what) {
         System.out.println((ok ? "PASS " : "FAIL ") + what);
         if (!ok) failures++;
@@ -152,6 +168,25 @@ public class VerifyPatchedApk {
                 check(a.equals(b), "Haiagaru hooks identical to Haiagaru-only APK for " + owner + " " + b);
             }
             check(!base.containsKey(UA) && hookCounts(base, UA).isEmpty(), "Haiagaru-only APK has no UA Spoof code");
+
+            // 7. Haiagaru settings entry (v0.2.0): only our calls were added to the two methods.
+            String entry = "Lapp/morphe/extension/chmateuaspoof/UaSpoofHaiagaruEntry;";
+            String groups = entry + "->groups(Ljava/util/List;)Ljava/util/List;";
+            String category = entry + "->category(Landroid/app/Activity;Ljava/lang/String;)Landroid/widget/LinearLayout;";
+            List<String> g0 = code(base, "Lapp/morphe/extension/chmate/HaiagaruSettingsActivityKt;", "settingsGroups");
+            List<String> g1 = code(both, "Lapp/morphe/extension/chmate/HaiagaruSettingsActivityKt;", "settingsGroups");
+            List<String> c0 = code(base, "Lapp/morphe/extension/chmate/Haiagaru;", "settingsCategory");
+            List<String> c1 = code(both, "Lapp/morphe/extension/chmate/Haiagaru;", "settingsCategory");
+            List<String> expectG = new ArrayList<>();
+            for (String i : g0) {
+                if (i.equals("RETURN_OBJECT")) { expectG.add("INVOKE_STATIC_RANGE " + groups); expectG.add("MOVE_RESULT_OBJECT"); }
+                expectG.add(i);
+            }
+            check(!g0.isEmpty() && g1.equals(expectG), "Settings top: settingsGroups unchanged except UaSpoofHaiagaruEntry.groups before each return (" + g0.size() + " -> " + g1.size() + ")");
+            List<String> expectC = new ArrayList<>(List.of("INVOKE_STATIC_RANGE " + category, "MOVE_RESULT_OBJECT", "IF_EQZ", "RETURN_OBJECT"));
+            expectC.addAll(c0);
+            check(!c0.isEmpty() && c1.equals(expectC), "Settings category: settingsCategory unchanged after a 4-instruction UaSpoofHaiagaruEntry.category prefix (" + c0.size() + " -> " + c1.size() + ")");
+            check(both.containsKey(entry) && !base.containsKey(entry), "UaSpoofHaiagaruEntry present only in the combined APK");
         }
         System.out.println(failures == 0 ? "ALL CHECKS PASSED" : failures + " CHECK(S) FAILED");
         System.exit(failures == 0 ? 0 : 1);
